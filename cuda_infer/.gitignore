@@ -1,0 +1,3 @@
+*.bin
+*.so
+__pycache__/
