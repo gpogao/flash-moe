@@ -40,21 +40,23 @@ __device__ uint16_t f32_to_bf16(float f) {
 // ============================================================================
 // Kernel 1: GPTQ 4-bit dequantized matrix-vector multiply
 // ============================================================================
-// GPTQ-Int4 format:
-//   qweight: uint32 [out_dim, in_dim//8] — 8 nibbles per uint32
-//   scales:  bfloat16 [out_dim, in_dim//group_size] — per-group scale
-//   qzeros:  bfloat16 [out_dim, in_dim//group_size] — per-group zero point
+// GPTQ-Int4 format (auto-gptq / HuggingFace layout):
+//   qweight: uint32 [in_dim//8, out_dim] — 8 nibbles per uint32 along in_dim
+//   scales:  bfloat16 [in_dim//group_size, out_dim] — per-group scale per row
+//   qzeros:  uint32 [in_dim//group_size, out_dim//8] — packed 4-bit zeros per row
 //
-// Dequant formula: weight = (nibble - qzero) * scale
+// Dequant formula: weight = (nibble - zero) * scale
+// where zero is unpacked from qzeros nibble at (g, row)
 //
-// Layouts:
-//   gate_proj/up_proj: [512, 2048] -> packed_cols = 2048/8 = 256
-//   down_proj: [2048, 512] -> packed_cols = 512/8 = 64
+// For gate_proj/up_proj: out_dim=512, in_dim=2048, group_size=128
+//   qweight [256, 512], scales [16, 512], qzeros [16, 64]
+// For down_proj: out_dim=2048, in_dim=512
+//   qweight [64, 2048], scales [4, 2048], qzeros [4, 256]
 
 __global__ void dequant_matvec_gptq_kernel(
     const uint32_t *qweight,
-    const uint16_t *scales,
-    const uint16_t *qzeros,
+    const float *scales,
+    const uint32_t *qzeros,
     const float *x,
     float *out,
     int out_dim,
@@ -64,20 +66,28 @@ __global__ void dequant_matvec_gptq_kernel(
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= out_dim) return;
 
-    int packed_cols = in_dim / 8;
-    int num_groups = in_dim / group_size;
+    int packed_cols = in_dim / 8;           // chunks along input dim
+    int qz_packed_cols = out_dim / 8;       // chunks along output dim (for qzeros)
+    int group_len = group_size / 8;         // packed cols per group
+
     float result = 0.0f;
 
     for (int col = 0; col < packed_cols; col++) {
-        int weight_idx = row * packed_cols + col;
+        // qweight stored as [in_dim/8, out_dim] → index at [col][row]
+        int weight_idx = col * out_dim + row;
         uint32_t packed = qweight[weight_idx];
 
-        int g = col / (group_size / 8);
-        float scale = bf16_to_f32(scales[row * num_groups + g]);
-        float zero = bf16_to_f32(qzeros[row * num_groups + g]);
+        int g = col / group_len;
+        // scales stored as [num_groups, out_dim] float32 → index at [g][row]
+        float scale = scales[g * out_dim + row];
+
+        // qzeros stored as [num_groups, out_dim/8] int32, zero at nibble (row%8)
+        int qz_nibble = row % 8;
+        uint32_t qz_packed = qzeros[g * qz_packed_cols + (row / 8)];
+        float zero = (float)((qz_packed >> (qz_nibble * 4)) & 0xF);
 
         for (int n = 0; n < 8; n++) {
-            float w = (float((packed >> (n * 4)) & 0xF) - zero) * scale;
+            float w = ((float)((packed >> (n * 4)) & 0xF) - zero) * scale;
             result += w * x[col * 8 + n];
         }
     }
@@ -86,8 +96,8 @@ __global__ void dequant_matvec_gptq_kernel(
 
 extern "C" {
 void cuda_dequant_matvec_gptq(
-    const uint32_t *d_qweight, const uint16_t *d_scales,
-    const uint16_t *d_qzeros, const float *d_x,
+    const uint32_t *d_qweight, const float *d_scales,
+    const uint32_t *d_qzeros, const float *d_x,
     float *d_out, int out_dim, int in_dim, int group_size,
     cudaStream_t stream
 ) {

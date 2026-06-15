@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,6 +105,25 @@ static inline float bf16_to_f32(uint16_t bf16) {
     return f;
 }
 
+// IEEE 754 float16 -> float32 conversion
+static inline float f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) & 1;
+    uint32_t exp  = (uint32_t)(h >> 10) & 0x1F;
+    uint32_t mant = (uint32_t)h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) { bits = sign << 31; }  // zero
+        else { bits = (sign << 31) | (mant << 13); }  // subnormal
+    } else if (exp == 31) {
+        bits = (sign << 31) | (0xFFu << 23) | (mant << 13);  // inf/nan
+    } else {
+        bits = (sign << 31) | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
 __attribute__((unused))
 static inline uint16_t f32_to_bf16(float f) {
     uint32_t bits;
@@ -162,19 +182,22 @@ static void cpu_topk(
     int n,
     int k
 ) {
-    // Simple selection: find top-k by value
+    // Track which experts have been selected
+    char *used = (char *)calloc(n, 1);
     for (int i = 0; i < k; i++) {
-        int max_idx = i;
-        float max_val = scores[i];
-        for (int j = i + 1; j < n; j++) {
-            if (scores[j] > max_val) {
+        int max_idx = -1;
+        float max_val = -1e30f;
+        for (int j = 0; j < n; j++) {
+            if (!used[j] && scores[j] > max_val) {
                 max_val = scores[j];
                 max_idx = j;
             }
         }
         indices[i] = max_idx;
         weights[i] = max_val;
+        used[max_idx] = 1;
     }
+    free(used);
 
     // Softmax over top-k
     float max_val = weights[0];
@@ -1360,6 +1383,7 @@ static void forward_layer_gpu(
     float *cpu_scores = (float *)malloc(NUM_EXPERTS * sizeof(float));
     CHECK_CUDA(cudaMemcpy(cpu_scores, d_routing_scores, NUM_EXPERTS * sizeof(float),
                           cudaMemcpyDeviceToHost));
+
     cudaFree(d_routing_scores);
 
     // CPU softmax
@@ -1386,57 +1410,83 @@ static void forward_layer_gpu(
     for (int k = 0; k < NUM_EXPERTS_PER_TOK; k++) {
         int eid = topk_idx[k];
 
-        // gate_proj: [MOE_INTERMEDIATE, HIDDEN_DIM] = [512, 2048] GPTQ dequant
-        size_t gate_qw_bytes = MOE_INTERMEDIATE * (HIDDEN_DIM / 8) * sizeof(uint32_t);
-        size_t gate_sc_bytes = MOE_INTERMEDIATE * (HIDDEN_DIM / GROUP_SIZE) * sizeof(uint16_t);
-        ensure_scratch(gate_qw_bytes + gate_sc_bytes * 2 + 4096);
-        uint32_t *d_gate_qw = (uint32_t *)d_scratch_w;
-        uint16_t *d_gate_sc = (uint16_t *)((char *)d_scratch_w + gate_qw_bytes);
-        uint16_t *d_gate_qz = (uint16_t *)((char *)d_gate_sc + gate_sc_bytes);
-        snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.gate_proj.qweight", layer_idx, eid);
-        load_tensor_to_gpu(wd, tname, d_gate_qw, stream);
-        snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.gate_proj.scales", layer_idx, eid);
-        load_tensor_to_gpu(wd, tname, d_gate_sc, stream);
-        snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.gate_proj.qzeros", layer_idx, eid);
-        load_tensor_to_gpu(wd, tname, d_gate_qz, stream);
-        cuda_dequant_matvec_gptq(d_gate_qw, d_gate_sc, d_gate_qz, b->d_rms_out,
-                                  b->d_gate, MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, stream);
+        // gate_proj: GPTQ dequant [out=512, in=2048, group=128]
+        // qweight [256, 512] int32 | scales [16, 512] float16→float32 | qzeros [16, 64] int32
+        {
+            int num_sc = MOE_INTERMEDIATE * (HIDDEN_DIM / GROUP_SIZE);       // 8192
+            int num_qz = (HIDDEN_DIM / GROUP_SIZE) * (MOE_INTERMEDIATE / 8); // 1024
+            size_t qw_bytes = MOE_INTERMEDIATE * (HIDDEN_DIM / 8) * sizeof(uint32_t);   // 524288
+            size_t sc_bytes = num_sc * sizeof(float);                                    // 32768
+            size_t qz_bytes = num_qz * sizeof(uint32_t);                                 // 4096
+            ensure_scratch(qw_bytes + sc_bytes + qz_bytes + 4096);
+            uint32_t *d_qw = (uint32_t *)d_scratch_w;
+            float    *d_sc = (float *)((char *)d_scratch_w + qw_bytes);
+            uint32_t *d_qz = (uint32_t *)((char *)d_sc + sc_bytes);
 
-        // up_proj: [MOE_INTERMEDIATE, HIDDEN_DIM] = [512, 2048] GPTQ dequant
-        size_t up_qw_bytes = MOE_INTERMEDIATE * (HIDDEN_DIM / 8) * sizeof(uint32_t);
-        size_t up_sc_bytes = MOE_INTERMEDIATE * (HIDDEN_DIM / GROUP_SIZE) * sizeof(uint16_t);
-        ensure_scratch(up_qw_bytes + up_sc_bytes * 2 + 4096);
-        uint32_t *d_up_qw = (uint32_t *)d_scratch_w;
-        uint16_t *d_up_sc = (uint16_t *)((char *)d_scratch_w + up_qw_bytes);
-        uint16_t *d_up_qz = (uint16_t *)((char *)d_up_sc + up_sc_bytes);
-        snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.up_proj.qweight", layer_idx, eid);
-        load_tensor_to_gpu(wd, tname, d_up_qw, stream);
-        snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.up_proj.scales", layer_idx, eid);
-        load_tensor_to_gpu(wd, tname, d_up_sc, stream);
-        snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.up_proj.qzeros", layer_idx, eid);
-        load_tensor_to_gpu(wd, tname, d_up_qz, stream);
-        cuda_dequant_matvec_gptq(d_up_qw, d_up_sc, d_up_qz, b->d_rms_out,
-                                  b->d_up, MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, stream);
+            snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.gate_proj.qweight", layer_idx, eid);
+            load_tensor_to_gpu(wd, tname, d_qw, stream);
+            snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.gate_proj.qzeros", layer_idx, eid);
+            load_tensor_to_gpu(wd, tname, d_qz, stream);
+            // scales: f16 in file → f32 on GPU
+            snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.gate_proj.scales", layer_idx, eid);
+            {
+                int idx = find_tensor(wd, tname);
+                if (idx >= 0) {
+                    TensorInfo *t = &wd->tensors[idx];
+                    size_t data_start = 4 + wd->header_size;
+                    size_t data_start_aligned = (data_start + 63) & ~63ULL;
+                    uint16_t *src = (uint16_t *)((uint8_t *)wd->base + (t->offset - data_start_aligned));
+                    float *cpu_sc = (float *)malloc(num_sc * sizeof(float));
+                    for (int i = 0; i < num_sc; i++) cpu_sc[i] = f16_to_f32(src[i]);
+                    CHECK_CUDA(cudaMemcpy(d_sc, cpu_sc, sc_bytes, cudaMemcpyHostToDevice));
+                    free(cpu_sc);
+                }
+            }
+            cuda_dequant_matvec_gptq(d_qw, d_sc, d_qz, b->d_rms_out,
+                                      b->d_gate, MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, stream);
+
+
+            cuda_dequant_matvec_gptq(d_qw, d_sc, d_qz, b->d_rms_out,
+                                      b->d_up, MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, stream);
+        }
 
         // SwiGLU(gate_out, up_out) -> intermediate [MOE_INTERMEDIATE]
         cuda_swiglu(b->d_gate, b->d_up, b->d_swiglu, MOE_INTERMEDIATE, stream);
 
-        // down_proj: [HIDDEN_DIM, MOE_INTERMEDIATE] = [2048, 512] GPTQ dequant
-        size_t dn_qw_bytes = HIDDEN_DIM * (MOE_INTERMEDIATE / 8) * sizeof(uint32_t);
-        size_t dn_sc_bytes = HIDDEN_DIM * (MOE_INTERMEDIATE / GROUP_SIZE) * sizeof(uint16_t);
-        ensure_scratch(dn_qw_bytes + dn_sc_bytes * 2 + 4096);
-        uint32_t *d_dn_qw = (uint32_t *)d_scratch_w;
-        uint16_t *d_dn_sc = (uint16_t *)((char *)d_scratch_w + dn_qw_bytes);
-        uint16_t *d_dn_qz = (uint16_t *)((char *)d_dn_sc + dn_sc_bytes);
-        snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.down_proj.qweight", layer_idx, eid);
-        load_tensor_to_gpu(wd, tname, d_dn_qw, stream);
-        snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.down_proj.scales", layer_idx, eid);
-        load_tensor_to_gpu(wd, tname, d_dn_sc, stream);
-        snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.down_proj.qzeros", layer_idx, eid);
-        load_tensor_to_gpu(wd, tname, d_dn_qz, stream);
-        cuda_dequant_matvec_gptq(d_dn_qw, d_dn_sc, d_dn_qz, b->d_swiglu,
-                                  b->d_expert_out + k * HIDDEN_DIM,
-                                  HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE, stream);
+        // down_proj: GPTQ dequant [out=2048, in=512, group=128]
+        {
+            int num_sc = HIDDEN_DIM * (MOE_INTERMEDIATE / GROUP_SIZE);
+            int num_qz = (MOE_INTERMEDIATE / GROUP_SIZE) * (HIDDEN_DIM / 8);
+            size_t qw_bytes = HIDDEN_DIM * (MOE_INTERMEDIATE / 8) * sizeof(uint32_t);
+            size_t sc_bytes = num_sc * sizeof(float);
+            size_t qz_bytes = num_qz * sizeof(uint32_t);
+            ensure_scratch(qw_bytes + sc_bytes + qz_bytes + 4096);
+            uint32_t *d_qw = (uint32_t *)d_scratch_w;
+            float    *d_sc = (float *)((char *)d_scratch_w + qw_bytes);
+            uint32_t *d_qz = (uint32_t *)((char *)d_sc + sc_bytes);
+
+            snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.down_proj.qweight", layer_idx, eid);
+            load_tensor_to_gpu(wd, tname, d_qw, stream);
+            snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.down_proj.qzeros", layer_idx, eid);
+            load_tensor_to_gpu(wd, tname, d_qz, stream);
+            snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.down_proj.scales", layer_idx, eid);
+            {
+                int idx = find_tensor(wd, tname);
+                if (idx >= 0) {
+                    TensorInfo *t = &wd->tensors[idx];
+                    size_t data_start = 4 + wd->header_size;
+                    size_t data_start_aligned = (data_start + 63) & ~63ULL;
+                    uint16_t *src = (uint16_t *)((uint8_t *)wd->base + (t->offset - data_start_aligned));
+                    float *cpu_sc = (float *)malloc(num_sc * sizeof(float));
+                    for (int i = 0; i < num_sc; i++) cpu_sc[i] = f16_to_f32(src[i]);
+                    CHECK_CUDA(cudaMemcpy(d_sc, cpu_sc, sc_bytes, cudaMemcpyHostToDevice));
+                    free(cpu_sc);
+                }
+            }
+            cuda_dequant_matvec_gptq(d_qw, d_sc, d_qz, b->d_swiglu,
+                                      b->d_expert_out + k * HIDDEN_DIM,
+                                      HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE, stream);
+        }
     }
 
     // ========== Weighted sum of expert outputs ==========
@@ -1489,7 +1539,6 @@ static void forward_layer_gpu(
     // Residual: hidden += moe + shared
     cuda_residual_add(d_hidden, b->d_output, d_hidden, HIDDEN_DIM, stream);
     cuda_residual_add(d_hidden, b->d_combined, d_hidden, HIDDEN_DIM, stream);
-    CHECK_CUDA(cudaStreamSynchronize(stream));
 }
 
 // ============================================================================
@@ -1511,8 +1560,10 @@ int main(int argc, char **argv) {
     int max_tokens = 100;
 
     // Parse arguments
+    const char *token_ids_str = NULL;
     static struct option long_options[] = {
         {"prompt", required_argument, 0, 'p'},
+        {"token-ids", required_argument, 0, 'i'},
         {"tokens", required_argument, 0, 't'},
         {"weights", required_argument, 0, 'w'},
         {"help", no_argument, 0, 'h'},
@@ -1520,10 +1571,13 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:t:w:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:i:t:w:h", long_options, NULL)) != -1) {
         switch (opt) {
             case 'p':
                 prompt = optarg;
+                break;
+            case 'i':
+                token_ids_str = optarg;
                 break;
             case 't':
                 max_tokens = atoi(optarg);
@@ -1540,23 +1594,21 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (prompt == NULL) {
-        fprintf(stderr, "Error: --prompt is required\n");
+    if (prompt == NULL && token_ids_str == NULL) {
+        fprintf(stderr, "Error: --prompt or --token-ids is required\n");
         print_help(argv[0]);
         return 1;
     }
-
-    fprintf(stderr, "=== CUDA Inference Engine ===\n");
-    fprintf(stderr, "Prompt: %s\n", prompt);
-    fprintf(stderr, "Max tokens: %d\n", max_tokens);
-    fprintf(stderr, "Weights: %s\n", weights_path);
 
     // Initialize CUDA
     int device;
     CHECK_CUDA(cudaGetDevice(&device));
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, device));
+    fprintf(stderr, "=== CUDA Inference Engine ===\n");
     fprintf(stderr, "Using device %d: %s\n", device, prop.name);
+    fprintf(stderr, "Max tokens: %d\n", max_tokens);
+    srand(time(NULL));
 
     cudaStream_t stream;
     CHECK_CUDA(cudaStreamCreate(&stream));
@@ -1566,7 +1618,7 @@ int main(int argc, char **argv) {
     cublasCreate(&cublas);
     cublasSetStream(cublas, stream);
 
-    // Load tokenizer
+    // Load tokenizer (needed for decoding output tokens)
     fprintf(stderr, "Loading tokenizer...\n");
     bpe_tokenizer tok;
     if (bpe_load(&tok, "tokenizer.bin") != 0) {
@@ -1576,7 +1628,26 @@ int main(int argc, char **argv) {
 
     // Encode prompt
     uint32_t input_ids[4096];
-    int num_tokens = bpe_encode(&tok, prompt, input_ids, 4096);
+    int num_tokens;
+
+    if (token_ids_str) {
+        // Parse comma-separated token IDs
+        num_tokens = 0;
+        const char *p = token_ids_str;
+        while (*p && num_tokens < 4096) {
+            while (*p == ' ' || *p == ',') p++;
+            if (*p == '\0') break;
+            input_ids[num_tokens++] = (uint32_t)strtoul(p, (char**)&p, 10);
+        }
+        fprintf(stderr, "Parsed %d token IDs: ", num_tokens);
+        for (int i = 0; i < num_tokens && i < 10; i++)
+            fprintf(stderr, "%u ", input_ids[i]);
+        fprintf(stderr, "\n");
+    } else {
+        fprintf(stderr, "Prompt: %s\n", prompt);
+        num_tokens = bpe_encode(&tok, prompt, input_ids, 4096);
+    }
+
     fprintf(stderr, "Encoded %d tokens\n", num_tokens);
 
     // Load weights
@@ -1626,8 +1697,29 @@ int main(int argc, char **argv) {
     CHECK_CUDA(cudaMalloc(&d_hidden, HIDDEN_DIM * sizeof(float)));
 
     int generation_position = 0;
-    uint32_t current_token = input_ids[num_tokens - 1];
+    uint32_t current_token;
     int generated = 0;
+
+    // ========== Prompt prefill: feed all prompt tokens to build KV cache / linear state ==========
+    fprintf(stderr, "Prefilling %d prompt tokens...\n", num_tokens);
+    for (int p = 0; p < num_tokens; p++) {
+        current_token = input_ids[p];
+        uint16_t *token_embed = embed_base + (size_t)current_token * HIDDEN_DIM;
+        float cpu_embed[HIDDEN_DIM];
+        for (int i = 0; i < HIDDEN_DIM; i++) cpu_embed[i] = bf16_to_f32(token_embed[i]);
+        CHECK_CUDA(cudaMemcpy(d_hidden, cpu_embed, HIDDEN_DIM * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        if (p == 0) {
+            float ss=0; for(int i=0;i<HIDDEN_DIM;i++)ss+=cpu_embed[i]*cpu_embed[i];
+            fprintf(stderr,"  embed token=%u (prompt[%d]) rms=%.4f first4=%.3f %.3f %.3f %.3f\n",
+                current_token, p, sqrtf(ss/HIDDEN_DIM), cpu_embed[0], cpu_embed[1], cpu_embed[2], cpu_embed[3]);
+        }
+        for (int layer = 0; layer < NUM_LAYERS; layer++) {
+            forward_layer_gpu(d_hidden, &wd, &buffers, layer, generation_position,
+                               kv_caches, linear_states, stream);
+        }
+        generation_position++;
+    }
 
     // Allocate reusable per-step buffers
     float *d_final_norm_w, *d_logits;
@@ -1640,35 +1732,10 @@ int main(int argc, char **argv) {
                           cudaMemcpyHostToDevice));
     free(final_norm_cpu);
 
+    // ========== Decode loop: generate new tokens ==========
+    // After prefill, d_hidden contains the last prompt token's output.
+    // Compute logits for the first generated token directly.
     for (int t = 0; t < max_tokens; t++) {
-        // ---- Token embedding (BF16 -> float32 on CPU) ----
-        uint16_t *token_embed = embed_base + (size_t)current_token * HIDDEN_DIM;
-        float cpu_embed[HIDDEN_DIM];
-        for (int i = 0; i < HIDDEN_DIM; i++) {
-            cpu_embed[i] = bf16_to_f32(token_embed[i]);
-        }
-        CHECK_CUDA(cudaMemcpy(d_hidden, cpu_embed, HIDDEN_DIM * sizeof(float),
-                              cudaMemcpyHostToDevice));
-        if (t == 0) {
-            float ss=0; for(int i=0;i<HIDDEN_DIM;i++)ss+=cpu_embed[i]*cpu_embed[i];
-            fprintf(stderr,"  embed token=%d rms=%.4f first4=%.3f %.3f %.3f %.3f\n",
-                current_token,sqrtf(ss/HIDDEN_DIM),cpu_embed[0],cpu_embed[1],cpu_embed[2],cpu_embed[3]);
-        }
-
-        // ---- 40 transformer layers ----
-        for (int layer = 0; layer < NUM_LAYERS; layer++) {
-            forward_layer_gpu(d_hidden, &wd, &buffers, layer, generation_position,
-                               kv_caches, linear_states, stream);
-            if (t == 0 && (layer < 3 || layer == 3 || layer >= 37)) {
-                float *dbg = (float *)malloc(HIDDEN_DIM * sizeof(float));
-                CHECK_CUDA(cudaMemcpy(dbg, d_hidden, HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToHost));
-                float ss = 0; int n = 0;
-                for (int i = 0; i < HIDDEN_DIM; i++) { if (isnan(dbg[i])) n++; ss += dbg[i]*dbg[i]; }
-                fprintf(stderr, "  L%d rms=%.4f nan=%d\n", layer, sqrtf(ss/HIDDEN_DIM), n);
-                free(dbg);
-            }
-        }
-
         // ---- Final RMS norm ----
         cuda_rms_norm(d_hidden, d_final_norm_w, buffers.d_rms_out,
                       HIDDEN_DIM, RMS_NORM_EPS, stream);
@@ -1685,21 +1752,62 @@ int main(int argc, char **argv) {
                               cs, HIDDEN_DIM, stream);
         }
 
-        // ---- Argmax ----
+        // ---- Sampling: temperature + top-k + repetition penalty ----
         CHECK_CUDA(cudaStreamSynchronize(stream));
         float *cpu_logits = (float *)malloc(VOCAB_SIZE * sizeof(float));
         CHECK_CUDA(cudaMemcpy(cpu_logits, d_logits, VOCAB_SIZE * sizeof(float),
                               cudaMemcpyDeviceToHost));
 
-        int next_token = 0;
-        float max_logit = cpu_logits[0];
-        for (int i = 1; i < VOCAB_SIZE; i++) {
-            if (cpu_logits[i] > max_logit) {
-                max_logit = cpu_logits[i];
-                next_token = i;
+        // Repetition penalty: reduce logits for recently generated tokens
+        #define REP_HISTORY 16
+        static uint32_t recent_tokens[REP_HISTORY] = {0};
+        static int recent_pos = 0;
+        float rep_penalty = 1.15f;
+        for (int i = 0; i < REP_HISTORY; i++) {
+            uint32_t rt = recent_tokens[i];
+            if (rt != 0) {
+                if (cpu_logits[rt] > 0) cpu_logits[rt] /= rep_penalty;
+                else cpu_logits[rt] *= rep_penalty;
             }
         }
-        if (generated == 0) fprintf(stderr, "[dbg] t=%d max_l=%.2f l[0:3]=%.2f %.2f %.2f\n", next_token, max_logit, cpu_logits[0], cpu_logits[1], cpu_logits[2]);
+
+        // Temperature scaling
+        float temp = 0.8f;
+        float max_l = cpu_logits[0];
+        for (int i = 1; i < VOCAB_SIZE; i++)
+            if (cpu_logits[i] > max_l) max_l = cpu_logits[i];
+        float sum_exp = 0.0f;
+        for (int i = 0; i < VOCAB_SIZE; i++) {
+            cpu_logits[i] = expf((cpu_logits[i] - max_l) / temp);
+            sum_exp += cpu_logits[i];
+        }
+        // Top-k filtering
+        #define TOP_K 50
+        float topk_vals[TOP_K];
+        int topk_ids[TOP_K];
+        for (int i = 0; i < TOP_K; i++) { topk_vals[i] = -1.0f; topk_ids[i] = 0; }
+        for (int i = 0; i < VOCAB_SIZE; i++) {
+            int min_j = 0;
+            for (int j = 1; j < TOP_K; j++)
+                if (topk_vals[j] < topk_vals[min_j]) min_j = j;
+            if (cpu_logits[i] > topk_vals[min_j]) {
+                topk_vals[min_j] = cpu_logits[i];
+                topk_ids[min_j] = i;
+            }
+        }
+        // Renormalize top-k and sample
+        float tk_sum = 0.0f;
+        for (int i = 0; i < TOP_K; i++) { topk_vals[i] /= sum_exp; tk_sum += topk_vals[i]; }
+        float r = (float)rand() / (float)RAND_MAX * tk_sum;
+        float cum = 0.0f;
+        int next_token = topk_ids[0];
+        for (int i = 0; i < TOP_K; i++) {
+            cum += topk_vals[i];
+            if (r <= cum) { next_token = topk_ids[i]; break; }
+        }
+        recent_tokens[recent_pos % REP_HISTORY] = next_token;
+        recent_pos++;
+        if (generated == 0) fprintf(stderr, "[dbg] first_token=%d max_logit=%.2f\n", next_token, max_l);
         free(cpu_logits);
 
         // Check EOS before printing
@@ -1709,7 +1817,7 @@ int main(int argc, char **argv) {
         }
 
         // ---- Decode and print ----
-        if (t == 0) fprintf(stderr, "\n");
+        if (generated == 0) fprintf(stderr, "\n");
         char token_str[256];
         int token_len = bpe_decode_token(&tok, next_token, token_str, sizeof(token_str));
         if (token_len > 0) {
@@ -1717,9 +1825,21 @@ int main(int argc, char **argv) {
             fflush(stdout);
         }
 
-        generation_position++;
-        current_token = next_token;
         generated++;
+        if (t == max_tokens - 1) break;
+
+        // ---- Embed next token and run 40 layers ----
+        current_token = next_token;
+        generation_position++;
+        uint16_t *token_embed = embed_base + (size_t)current_token * HIDDEN_DIM;
+        float cpu_embed[HIDDEN_DIM];
+        for (int i = 0; i < HIDDEN_DIM; i++) cpu_embed[i] = bf16_to_f32(token_embed[i]);
+        CHECK_CUDA(cudaMemcpy(d_hidden, cpu_embed, HIDDEN_DIM * sizeof(float),
+                              cudaMemcpyHostToDevice));
+        for (int layer = 0; layer < NUM_LAYERS; layer++) {
+            forward_layer_gpu(d_hidden, &wd, &buffers, layer, generation_position,
+                               kv_caches, linear_states, stream);
+        }
     }
 
     cudaFree(d_final_norm_w);

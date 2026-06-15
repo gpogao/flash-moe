@@ -9,8 +9,8 @@ extern "C" {
 #endif
 
 void cuda_dequant_matvec_gptq(
-    const uint32_t *d_qweight, const uint16_t *d_scales,
-    const uint16_t *d_qzeros, const float *d_x,
+    const uint32_t *d_qweight, const float *d_scales,
+    const uint32_t *d_qzeros, const float *d_x,
     float *d_out, int out_dim, int in_dim, int group_size,
     cudaStream_t stream);
 

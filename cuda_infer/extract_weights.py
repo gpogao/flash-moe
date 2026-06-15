@@ -254,8 +254,24 @@ def main():
             out_f.write(data)
             offset += size
 
+    # Also write tensor_index.bin for fast C loading
+    index_path = output_bin.parent / 'tensor_index.bin'
+    print(f"\nWriting {index_path}...")
+    with open(index_path, 'wb') as idx_f:
+        idx_f.write(struct.pack('<I', 0x54504549))  # magic "IEPT"
+        idx_f.write(struct.pack('<I', 1))            # version
+        idx_f.write(struct.pack('<I', len(layout)))  # num_tensors
+        idx_f.write(struct.pack('<Q', data_offset))  # data_start in model_weights.bin
+        for san_name, orig_name, filename, off, size, shape, category in layout:
+            encoded = san_name.encode('utf-8')
+            idx_f.write(struct.pack('<I', len(encoded)))
+            idx_f.write(encoded)
+            idx_f.write(struct.pack('<Q', off + data_offset))
+            idx_f.write(struct.pack('<Q', size))
+    print(f"Tensor index written: {len(layout)} entries")
+
     elapsed = time.time() - t0
-    print(f"Written in {elapsed:.1f}s ({total_bytes / elapsed / 1e9:.1f} GB/s)")
+    print(f"\nTotal time: {elapsed:.1f}s ({total_bytes / elapsed / 1e9:.1f} GB/s)")
 
     # Summary
     print("\nExtracted tensors:")
