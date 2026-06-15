@@ -191,7 +191,7 @@ __global__ void rms_apply_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     float inv_rms = rsqrtf(sum_sq_ptr[0] / (float)n + eps);
-    out[idx] = x[idx] * inv_rms * weight[idx];
+    out[idx] = x[idx] * inv_rms * (1.0f + weight[idx]);
 }
 
 extern "C" {
@@ -679,14 +679,12 @@ __global__ void rms_norm_qk_kernel(
     }
     __syncthreads();
 
-    float q_inv_rms = rsqrtf(q_sum_sq / (float)key_dim + 1e-6f);
-    float k_inv_rms = rsqrtf(k_sum_sq / (float)key_dim + 1e-6f);
-    float q_scale = inv_scale * inv_scale;
-    float k_scale = inv_scale;
+    float q_l2norm = rsqrtf(q_sum_sq + 1e-6f);
+    float k_l2norm = rsqrtf(k_sum_sq + 1e-6f);
 
     if (tid < key_dim) {
-        q[base + tid] = q_val * q_inv_rms * q_scale;
-        k[base + tid] = k_val * k_inv_rms * k_scale;
+        q[base + tid] = q_val * q_l2norm * inv_scale;
+        k[base + tid] = k_val * k_l2norm;
     }
 }
 

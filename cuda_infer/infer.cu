@@ -742,6 +742,7 @@ static void gpu_bf16_matvec_direct(
 // ============================================================================
 // Full attention forward (GPU implementation)
 // ============================================================================
+static int g_debug = 0;
 static void forward_full_attention_gpu(
     const float *d_normed,     // [HIDDEN_DIM] on GPU
     float *d_attn_out,         // [HIDDEN_DIM] on GPU output
@@ -775,6 +776,15 @@ static void forward_full_attention_gpu(
     float *v_out = (float *)malloc(kv_dim * sizeof(float));
     snprintf(tname, sizeof(tname), "layers.%d.self_attn.v_proj.weight", layer_idx);
     gpu_bf16_matvec_cpu_io(cpu_normed, v_out, kv_dim, HIDDEN_DIM, wd, tname, stream);
+
+    if (g_debug && layer_idx == 3) {
+        float ss = 0; for (int i = 0; i < HIDDEN_DIM; i++) ss += cpu_normed[i] * cpu_normed[i];
+        fprintf(stderr, "  [L3 FA normed] rms=%.4f first4=%.4f %.4f %.4f %.4f\n",
+                sqrtf(ss/HIDDEN_DIM), cpu_normed[0], cpu_normed[1], cpu_normed[2], cpu_normed[3]);
+        ss = 0; for (int i = 0; i < kv_dim; i++) ss += k_out[i] * k_out[i];
+        fprintf(stderr, "  [L3 FA K] rms=%.4f first4=%.4f %.4f %.4f %.4f\n",
+                sqrtf(ss/kv_dim), k_out[0], k_out[1], k_out[2], k_out[3]);
+    }
 
     free(cpu_normed);
 
@@ -833,6 +843,18 @@ static void forward_full_attention_gpu(
     CHECK_CUDA(cudaMalloc(&d_k_rope, kv_dim * sizeof(float)));
     cuda_rope(d_q_normed, d_q_rope, NUM_ATTN_HEADS, HEAD_DIM, position, 10000000.0f, stream);
     cuda_rope(d_k_normed, d_k_rope, NUM_KV_HEADS, HEAD_DIM, position, 10000000.0f, stream);
+    if (g_debug && layer_idx == 3) {
+        float *tmp = (float *)malloc(q_dim * sizeof(float));
+        CHECK_CUDA(cudaMemcpy(tmp, d_q_rope, q_dim * sizeof(float), cudaMemcpyDeviceToHost));
+        float ss = 0; for (int i = 0; i < q_dim; i++) ss += tmp[i] * tmp[i];
+        fprintf(stderr, "  [L3 FA Q_rope] rms=%.4f first4=%.4f %.4f %.4f %.4f\n",
+                sqrtf(ss/q_dim), tmp[0], tmp[1], tmp[2], tmp[3]);
+        CHECK_CUDA(cudaMemcpy(tmp, d_k_rope, kv_dim * sizeof(float), cudaMemcpyDeviceToHost));
+        ss = 0; for (int i = 0; i < kv_dim; i++) ss += tmp[i] * tmp[i];
+        fprintf(stderr, "  [L3 FA K_rope] rms=%.4f first4=%.4f %.4f %.4f %.4f\n",
+                sqrtf(ss/kv_dim), tmp[0], tmp[1], tmp[2], tmp[3]);
+        free(tmp);
+    }
     cudaFree(d_q_normed); cudaFree(d_k_normed);
 
     // Update KV cache on GPU (must use cudaMemcpyAsync on same stream!)
@@ -1103,6 +1125,8 @@ static void forward_linear_attention_cpu(
 // ============================================================================
 // Linear attention forward (GPU implementation)
 // ============================================================================
+static void dump_gpu_f32(const float *d_buf, int n, const char *label, cudaStream_t stream);
+
 static void forward_linear_attention_gpu(
     const float *d_normed,    // [HIDDEN_DIM] on GPU
     float *d_attn_out,        // [HIDDEN_DIM] on GPU
@@ -1122,6 +1146,7 @@ static void forward_linear_attention_gpu(
     // 4 parallel projections: QKV, Z, B, A (all BF16 matvec)
     snprintf(tname, sizeof(tname), "layers.%d.linear_attn.in_proj_qkv.weight", layer_idx);
     gpu_bf16_matvec_direct(d_normed, d_qkv, LINEAR_CONV_DIM, HIDDEN_DIM, wd, tname, stream);
+    if (g_debug && layer_idx == 0) dump_gpu_f32(d_qkv, 8, "L0 lin_qkv(first8)", stream);
     snprintf(tname, sizeof(tname), "layers.%d.linear_attn.in_proj_z.weight", layer_idx);
     gpu_bf16_matvec_direct(d_normed, d_z, LINEAR_TOTAL_VALUE, HIDDEN_DIM, wd, tname, stream);
     snprintf(tname, sizeof(tname), "layers.%d.linear_attn.in_proj_b.weight", layer_idx);
@@ -1138,6 +1163,7 @@ static void forward_linear_attention_gpu(
     CHECK_CUDA(cudaMalloc(&d_conv_out, LINEAR_CONV_DIM * sizeof(float)));
     cuda_conv1d_step(state->d_conv_state, d_qkv, d_conv_w, d_conv_out, LINEAR_CONV_DIM, stream);
     cudaFree(d_conv_w);
+    if (g_debug && layer_idx == 0) dump_gpu_f32(d_conv_out, 8, "L0 conv_out(first8)", stream);
 
     // Split conv_out: q[0:2048], k[2048:4096], v[4096:12288]
     float *d_q = d_conv_out;
@@ -1147,6 +1173,10 @@ static void forward_linear_attention_gpu(
     // Q/K per-head RMS norm (in-place)
     float inv_scale = 1.0f / sqrtf((float)LINEAR_KEY_DIM);
     cuda_rms_norm_qk(d_q, d_k, LINEAR_NUM_K_HEADS, LINEAR_KEY_DIM, inv_scale, stream);
+    if (g_debug && layer_idx == 0) {
+        dump_gpu_f32(d_q, LINEAR_TOTAL_KEY, "L0 q_normed(full_Q)", stream);
+        dump_gpu_f32(d_k, LINEAR_TOTAL_KEY, "L0 k_normed(full_K)", stream);
+    }
 
     // Load A_log and dt_bias
     snprintf(tname, sizeof(tname), "layers.%d.linear_attn.A_log", layer_idx);
@@ -1161,6 +1191,10 @@ static void forward_linear_attention_gpu(
     float *d_beta_gate; CHECK_CUDA(cudaMalloc(&d_beta_gate, LINEAR_NUM_V_HEADS * sizeof(float)));
     cuda_compute_decay_beta(d_alpha, d_beta, d_A_log, d_dt_bias,
                              d_g_decay, d_beta_gate, LINEAR_NUM_V_HEADS, stream);
+    if (g_debug && layer_idx == 0) {
+        dump_gpu_f32(d_g_decay, LINEAR_NUM_V_HEADS, "L0 g_decay", stream);
+        dump_gpu_f32(d_beta_gate, LINEAR_NUM_V_HEADS, "L0 beta_gate", stream);
+    }
     cudaFree(d_A_log); cudaFree(d_dt_bias); cudaFree(d_alpha); cudaFree(d_beta);
 
     // Gated delta net recurrence
@@ -1170,6 +1204,7 @@ static void forward_linear_attention_gpu(
                                d_g_decay, d_beta_gate, d_out_values,
                                LINEAR_NUM_V_HEADS, LINEAR_VALUE_DIM, LINEAR_KEY_DIM,
                                LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS, stream);
+    if (g_debug && layer_idx == 0) dump_gpu_f32(d_out_values, LINEAR_TOTAL_VALUE, "L0 delta_out(full)", stream);
     cudaFree(d_g_decay); cudaFree(d_beta_gate);
 
     // Gated RMS norm: weight is float32 in file, kernel expects uint16_t (BF16)
@@ -1189,6 +1224,7 @@ static void forward_linear_attention_gpu(
     CHECK_CUDA(cudaMalloc(&d_gated, LINEAR_TOTAL_VALUE * sizeof(float)));
     cuda_gated_rms_norm(d_out_values, d_z, d_norm_w, d_gated,
                           LINEAR_NUM_V_HEADS, LINEAR_VALUE_DIM, RMS_NORM_EPS, stream);
+    if (g_debug && layer_idx == 0) dump_gpu_f32(d_gated, LINEAR_TOTAL_VALUE, "L0 gated(full)", stream);
     cudaFree(d_norm_w); cudaFree(d_out_values); cudaFree(d_z);
 
     // Output projection: [2048, 8192] BF16 matvec
@@ -1322,6 +1358,17 @@ static void forward_layer_cpu(
 // Forward layer with GPU kernels (MoE path)
 // ============================================================================
 
+static void dump_gpu_f32(const float *d_buf, int n, const char *label, cudaStream_t stream) {
+    CHECK_CUDA(cudaStreamSynchronize(stream));
+    float *cpu_buf = (float *)malloc(n * sizeof(float));
+    CHECK_CUDA(cudaMemcpy(cpu_buf, d_buf, n * sizeof(float), cudaMemcpyDeviceToHost));
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) ss += cpu_buf[i] * cpu_buf[i];
+    fprintf(stderr, "  [%s] rms=%.4f first4=%.4f %.4f %.4f %.4f\n",
+            label, sqrtf(ss / n), cpu_buf[0], cpu_buf[1], cpu_buf[2], cpu_buf[3]);
+    free(cpu_buf);
+}
+
 static void forward_layer_gpu(
     float *d_hidden,         // [HIDDEN_DIM] on GPU, in/out
     WeightData *wd,
@@ -1345,6 +1392,7 @@ static void forward_layer_gpu(
         free(cpu_norm);
     }
     cuda_rms_norm(d_hidden, d_norm_w, b->d_rms_out, HIDDEN_DIM, RMS_NORM_EPS, stream);
+    if (g_debug && layer_idx == 0) dump_gpu_f32(b->d_rms_out, HIDDEN_DIM, "L0 step1 rms_norm", stream);
     cudaFree(d_norm_w);
 
     // Step 2: Attention (GPU for full attn, CPU for linear attn)
@@ -1356,9 +1404,11 @@ static void forward_layer_gpu(
         forward_linear_attention_gpu(b->d_rms_out, b->d_output, wd, layer_idx,
                                       linear_states[layer_idx], stream);
     }
+    if (g_debug && layer_idx == 0) dump_gpu_f32(b->d_output, HIDDEN_DIM, "L0 step2 attn_out", stream);
 
     // Step 3: Residual add (hidden += attn_output)
     cuda_residual_add(d_hidden, b->d_output, d_hidden, HIDDEN_DIM, stream);
+    if (g_debug && layer_idx == 0) dump_gpu_f32(d_hidden, HIDDEN_DIM, "L0 step3 resid", stream);
 
     // Step 4: Post-attn RMS norm (weight is BF16 in file, upload as float32)
     CHECK_CUDA(cudaMalloc(&d_norm_w, HIDDEN_DIM * sizeof(float)));
@@ -1370,6 +1420,7 @@ static void forward_layer_gpu(
         free(cpu_norm);
     }
     cuda_rms_norm(d_hidden, d_norm_w, b->d_rms_out, HIDDEN_DIM, RMS_NORM_EPS, stream);
+    if (g_debug && layer_idx == 0) dump_gpu_f32(b->d_rms_out, HIDDEN_DIM, "L0 step4 post_norm", stream);
     cudaFree(d_norm_w);
 
     // ========== MoE routing (GPU gate matvec + CPU softmax + topK) ==========
@@ -1401,6 +1452,13 @@ static void forward_layer_gpu(
     int topk_idx[NUM_EXPERTS_PER_TOK];
     float topk_w[NUM_EXPERTS_PER_TOK];
     cpu_topk(cpu_scores, topk_idx, topk_w, NUM_EXPERTS, NUM_EXPERTS_PER_TOK);
+    if (g_debug && layer_idx == 0) {
+        fprintf(stderr, "  [L0 routing] topk_idx=");
+        for (int i = 0; i < NUM_EXPERTS_PER_TOK; i++) fprintf(stderr, "%d ", topk_idx[i]);
+        fprintf(stderr, " topk_w=");
+        for (int i = 0; i < NUM_EXPERTS_PER_TOK; i++) fprintf(stderr, "%.4f ", topk_w[i]);
+        fprintf(stderr, "\n");
+    }
     free(cpu_scores);
 
     // ========== Expert forward on GPU ==========
@@ -1410,24 +1468,25 @@ static void forward_layer_gpu(
     for (int k = 0; k < NUM_EXPERTS_PER_TOK; k++) {
         int eid = topk_idx[k];
 
-        // gate_proj: GPTQ dequant [out=512, in=2048, group=128]
-        // qweight [256, 512] int32 | scales [16, 512] float16→float32 | qzeros [16, 64] int32
+        // GPTQ dequant: gate_proj [out=512, in=2048, group=128]
+        // qweight [256, 512] int32 | scales [16, 512] F16→F32 | qzeros [16, 64] int32
+        // up_proj has same shapes, stored separately
         {
-            int num_sc = MOE_INTERMEDIATE * (HIDDEN_DIM / GROUP_SIZE);       // 8192
-            int num_qz = (HIDDEN_DIM / GROUP_SIZE) * (MOE_INTERMEDIATE / 8); // 1024
-            size_t qw_bytes = MOE_INTERMEDIATE * (HIDDEN_DIM / 8) * sizeof(uint32_t);   // 524288
-            size_t sc_bytes = num_sc * sizeof(float);                                    // 32768
-            size_t qz_bytes = num_qz * sizeof(uint32_t);                                 // 4096
+            int num_sc = MOE_INTERMEDIATE * (HIDDEN_DIM / GROUP_SIZE);
+            int num_qz = (HIDDEN_DIM / GROUP_SIZE) * (MOE_INTERMEDIATE / 8);
+            size_t qw_bytes = MOE_INTERMEDIATE * (HIDDEN_DIM / 8) * sizeof(uint32_t);
+            size_t sc_bytes = num_sc * sizeof(float);
+            size_t qz_bytes = num_qz * sizeof(uint32_t);
             ensure_scratch(qw_bytes + sc_bytes + qz_bytes + 4096);
             uint32_t *d_qw = (uint32_t *)d_scratch_w;
             float    *d_sc = (float *)((char *)d_scratch_w + qw_bytes);
             uint32_t *d_qz = (uint32_t *)((char *)d_sc + sc_bytes);
 
+            // --- gate_proj ---
             snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.gate_proj.qweight", layer_idx, eid);
             load_tensor_to_gpu(wd, tname, d_qw, stream);
             snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.gate_proj.qzeros", layer_idx, eid);
             load_tensor_to_gpu(wd, tname, d_qz, stream);
-            // scales: f16 in file → f32 on GPU
             snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.gate_proj.scales", layer_idx, eid);
             {
                 int idx = find_tensor(wd, tname);
@@ -1444,14 +1503,35 @@ static void forward_layer_gpu(
             }
             cuda_dequant_matvec_gptq(d_qw, d_sc, d_qz, b->d_rms_out,
                                       b->d_gate, MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, stream);
+            if (g_debug && layer_idx == 0 && k == 0) dump_gpu_f32(b->d_gate, MOE_INTERMEDIATE, "L0 expert0 gate_out", stream);
 
-
+            // --- up_proj (separate weights, reuse scratch on same stream) ---
+            snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.up_proj.qweight", layer_idx, eid);
+            load_tensor_to_gpu(wd, tname, d_qw, stream);
+            snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.up_proj.qzeros", layer_idx, eid);
+            load_tensor_to_gpu(wd, tname, d_qz, stream);
+            snprintf(tname, sizeof(tname), "layers.%d.mlp.experts.%d.up_proj.scales", layer_idx, eid);
+            {
+                int idx = find_tensor(wd, tname);
+                if (idx >= 0) {
+                    TensorInfo *t = &wd->tensors[idx];
+                    size_t data_start = 4 + wd->header_size;
+                    size_t data_start_aligned = (data_start + 63) & ~63ULL;
+                    uint16_t *src = (uint16_t *)((uint8_t *)wd->base + (t->offset - data_start_aligned));
+                    float *cpu_sc = (float *)malloc(num_sc * sizeof(float));
+                    for (int i = 0; i < num_sc; i++) cpu_sc[i] = f16_to_f32(src[i]);
+                    CHECK_CUDA(cudaMemcpy(d_sc, cpu_sc, sc_bytes, cudaMemcpyHostToDevice));
+                    free(cpu_sc);
+                }
+            }
             cuda_dequant_matvec_gptq(d_qw, d_sc, d_qz, b->d_rms_out,
                                       b->d_up, MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, stream);
+            if (g_debug && layer_idx == 0 && k == 0) dump_gpu_f32(b->d_up, MOE_INTERMEDIATE, "L0 expert0 up_out", stream);
         }
 
         // SwiGLU(gate_out, up_out) -> intermediate [MOE_INTERMEDIATE]
         cuda_swiglu(b->d_gate, b->d_up, b->d_swiglu, MOE_INTERMEDIATE, stream);
+        if (g_debug && layer_idx == 0 && k == 0) dump_gpu_f32(b->d_swiglu, MOE_INTERMEDIATE, "L0 expert0 swiglu", stream);
 
         // down_proj: GPTQ dequant [out=2048, in=512, group=128]
         {
@@ -1486,6 +1566,7 @@ static void forward_layer_gpu(
             cuda_dequant_matvec_gptq(d_qw, d_sc, d_qz, b->d_swiglu,
                                       b->d_expert_out + k * HIDDEN_DIM,
                                       HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE, stream);
+            if (g_debug && layer_idx == 0 && k == 0) dump_gpu_f32(b->d_expert_out, HIDDEN_DIM, "L0 expert0 down_out", stream);
         }
     }
 
@@ -1496,6 +1577,7 @@ static void forward_layer_gpu(
                           NUM_EXPERTS_PER_TOK * sizeof(float), cudaMemcpyHostToDevice));
     cuda_weighted_sum(b->d_expert_out, d_routing_weights, b->d_output,
                        NUM_EXPERTS_PER_TOK, HIDDEN_DIM, stream);
+    if (g_debug && layer_idx == 0) dump_gpu_f32(b->d_output, HIDDEN_DIM, "L0 step6 moe_combined", stream);
     cudaFree(d_routing_weights);
 
     // ========== Shared expert ==========
@@ -1537,8 +1619,11 @@ static void forward_layer_gpu(
     free(shared_cpu);
 
     // Residual: hidden += moe + shared
+    if (g_debug && layer_idx == 0) dump_gpu_f32(b->d_combined, HIDDEN_DIM, "L0 step7 shared_after_gate", stream);
     cuda_residual_add(d_hidden, b->d_output, d_hidden, HIDDEN_DIM, stream);
+    if (g_debug && layer_idx == 0) dump_gpu_f32(d_hidden, HIDDEN_DIM, "L0 step8 after_moe_resid", stream);
     cuda_residual_add(d_hidden, b->d_combined, d_hidden, HIDDEN_DIM, stream);
+    if (g_debug && layer_idx == 0) dump_gpu_f32(d_hidden, HIDDEN_DIM, "L0 step9 after_all_resid", stream);
 }
 
 // ============================================================================
@@ -1551,6 +1636,7 @@ static void print_help(const char *prog) {
     fprintf(stderr, "  --prompt TEXT    Input prompt (required)\n");
     fprintf(stderr, "  --tokens N       Max tokens to generate (default: 100)\n");
     fprintf(stderr, "  --weights PATH   Path to weights file (default: model_weights.bin)\n");
+    fprintf(stderr, "  --debug          Print per-layer hidden state during prefill\n");
     fprintf(stderr, "  --help           Show this help\n");
 }
 
@@ -1566,12 +1652,13 @@ int main(int argc, char **argv) {
         {"token-ids", required_argument, 0, 'i'},
         {"tokens", required_argument, 0, 't'},
         {"weights", required_argument, 0, 'w'},
+        {"debug", no_argument, 0, 'd'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:i:t:w:h", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:i:t:w:dh", long_options, NULL)) != -1) {
         switch (opt) {
             case 'p':
                 prompt = optarg;
@@ -1584,6 +1671,9 @@ int main(int argc, char **argv) {
                 break;
             case 'w':
                 weights_path = optarg;
+                break;
+            case 'd':
+                g_debug = 1;
                 break;
             case 'h':
                 print_help(argv[0]);
@@ -1717,6 +1807,19 @@ int main(int argc, char **argv) {
         for (int layer = 0; layer < NUM_LAYERS; layer++) {
             forward_layer_gpu(d_hidden, &wd, &buffers, layer, generation_position,
                                kv_caches, linear_states, stream);
+
+            if (g_debug && p == num_tokens - 1) {
+                CHECK_CUDA(cudaStreamSynchronize(stream));
+                float *cpu_lh = (float *)malloc(HIDDEN_DIM * sizeof(float));
+                CHECK_CUDA(cudaMemcpy(cpu_lh, d_hidden, HIDDEN_DIM * sizeof(float),
+                                      cudaMemcpyDeviceToHost));
+                float ss = 0.0f;
+                for (int i = 0; i < HIDDEN_DIM; i++) ss += cpu_lh[i] * cpu_lh[i];
+                fprintf(stderr, "Layer %2d: rms=%.4f first4=%.4f %.4f %.4f %.4f\n",
+                        layer, sqrtf(ss / HIDDEN_DIM),
+                        cpu_lh[0], cpu_lh[1], cpu_lh[2], cpu_lh[3]);
+                free(cpu_lh);
+            }
         }
         generation_position++;
     }
